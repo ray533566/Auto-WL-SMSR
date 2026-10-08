@@ -9,9 +9,17 @@ import streamlit as st
 from fill_chart_templates import fill_template
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+def find_template(name):
+    """Look in templates/ first, then next to app.py."""
+    for p in (os.path.join(HERE, "templates", name), os.path.join(HERE, name)):
+        if os.path.isfile(p):
+            return p
+    return os.path.join(HERE, name)
+
+
 TEMPLATES = {
-    "50-400mA": os.path.join(HERE, "templates", "Template-50-400mA.xlsx"),
-    "80-400mA": os.path.join(HERE, "templates", "Template-80-400mA.xlsx"),
+    "50-400mA": find_template("Template-50-400mA.xlsx"),
+    "80-400mA": find_template("Template-80-400mA.xlsx"),
 }
 
 st.set_page_config(page_title="OSA Chart Auto-Fill", page_icon="📈", layout="centered")
