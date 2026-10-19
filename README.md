@@ -1,34 +1,38 @@
-# OSA Chart Auto-Fill
+# 📊 Excel Mapping Combiner
 
-Fills the **50-400mA** and **80-400mA** chart Excel templates from OSA raw-data TXT files
-(e.g. `48226H40040_A2026100620533560886.txt`).
+Streamlit web app that combines the **`Mapping`** sheet of `*-Chart-80-400mA.xlsx` test files into one Excel sheet.
 
-## Web app (Streamlit)
-Upload one or more TXT files → download `<TXT>-Chart-50-400mA.xlsx` and `<TXT>-Chart-80-400mA.xlsx`
-(several files are bundled into one zip). You can also upload a different template in the sidebar.
+## Functions (checkboxes)
 
-Run locally:
-```
+| | Function | What it does |
+|---|---|---|
+| ① | **Auto-combine Excel files** | Upload many Chart files → one sheet. Row 1 (header) kept once, columns **A..AZ**, values only. |
+| ② | **Append to previous Excel** | Upload the previous combined Excel + new file(s) → new rows are added **below the old rows**. |
+
+Tick both to combine several new files and append them to the old file in one step.
+
+**Details**
+- Values come from Excel's cached formula results. If a file was never saved in Excel (no cache), the Mapping values are recalculated from the `RawData` sheet.
+- *Skip duplicates* (sidebar, on by default): a new file whose SN + TESTNUMBER already exists is skipped.
+- Works with any Mapping template (80-400mA, 100-400mA, extra columns such as Case_Temp / DDMI_Temp): the fallback reads the Mapping formulas, nothing is hard-coded.
+- Header cells like `=RawData!A2&"-Case_Temp"` are written as `Case_Temp` (no SN prefix).
+- Files whose columns differ from the base file (e.g. 80-400mA mixed with 100-400mA) are skipped as HEADER MISMATCH — combine each template separately.
+- New files can be Chart files (`Mapping` sheet) or already-combined files (`Combine` / first sheet).
+- Sidebar: source sheet name, column range, output file name.
+
+## Run locally
+```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Command line (Windows / no Streamlit needed)
-```
-python fill_chart_templates.py RAW.txt [RAW2.txt ...]      # or a folder of TXT files
-python fill_chart_templates.py                              # opens a file picker
-python fill_chart_templates.py RAW.txt --t50 T50.xlsx --t80 T80.xlsx --out D:\Output
-```
-
-## What it does
-- **RawData** sheet: replaced with the TXT data in the Power Query layout (`Temp_-5` → `Temp`, `-5`).
-- **Mapping** sheet: formulas untouched; cached values recalculated; Excel fully recalculates on open.
-- **Charts**: SN in the 4 chart titles updated; charts, styles and filters otherwise kept.
+## Deploy on Streamlit Community Cloud
+1. Push this folder to a GitHub repo (`app.py`, `combine_core.py`, `requirements.txt` in the repo root).
+2. Go to <https://share.streamlit.io> → **Create app** → pick the repo, branch `main`, main file `app.py` → **Deploy**.
 
 ## Files
-| File | Purpose |
-|---|---|
-| `app.py` | Streamlit web page |
-| `fill_chart_templates.py` | core logic + command-line tool (standard library only) |
-| `templates/Template-50-400mA.xlsx` | 50-400 mA template (36 currents × 4 CH × 17 temps) |
-| `templates/Template-80-400mA.xlsx` | 80-400 mA template (33 currents × 4 CH × 17 temps) |
+```
+app.py            Streamlit UI
+combine_core.py   combine / append logic (no UI, reusable)
+requirements.txt
+```
