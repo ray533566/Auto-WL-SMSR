@@ -18,12 +18,15 @@ What it does to each template copy
   * Workbook      : set to fully recalculate when opened in Excel
 Everything else (charts, styles, column widths, filters) is preserved byte-for-byte.
 
+Every Template-*.xlsx next to this script (or in a templates/ folder) is used, e.g.
+Template-50-400mA.xlsx, Template-80-400mA.xlsx, Template-100-400mA.xlsx. To add a new current
+range just drop in a new Template-<label>.xlsx - no code change needed.
+
 Usage
     python fill_chart_templates.py RAW.txt [RAW2.txt ...]
     python fill_chart_templates.py "D:\\OSA\\RawTxtFolder"            (all *.txt in folder)
-    python fill_chart_templates.py RAW.txt --t50 T50.xlsx --t80 T80.xlsx --out D:\\Output
+    python fill_chart_templates.py RAW.txt --templates D:\\MyTemplates --out D:\\Output
 
-Default template paths: Template-50-400mA.xlsx / Template-80-400mA.xlsx next to this script.
 Requires only the Python standard library (3.8+).
 """
 import argparse
@@ -36,8 +39,22 @@ import zipfile
 from xml.sax.saxutils import escape
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_T50 = os.path.join(HERE, "Template-50-400mA.xlsx")
-DEFAULT_T80 = os.path.join(HERE, "Template-80-400mA.xlsx")
+
+
+def find_templates(*folders):
+    """All Template-<label>.xlsx files (e.g. Template-100-400mA.xlsx) -> [(label, path)], sorted by current."""
+    found = {}
+    for d in folders:
+        for p in glob.glob(os.path.join(d, "Template-*.xlsx")):
+            name = os.path.basename(p)
+            if name.startswith("~$"):  # Excel lock file
+                continue
+            label = name[len("Template-"):-len(".xlsx")]
+            found.setdefault(label, p)
+    def key(lab):
+        m = re.match(r"(\d+)", lab)
+        return (int(m.group(1)) if m else 10**9, lab)
+    return [(lab, found[lab]) for lab in sorted(found, key=key)]
 
 NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
@@ -168,6 +185,7 @@ def rawdata_xml(sheet_xml, header_row_xml, rows):
                  lambda m: "<sheetData>" + "".join(parts) + "</sheetData>", sheet_xml, flags=re.S)
     last = len(rows) + 1
     new = re.sub(r'<dimension ref="[^"]*"/>', f'<dimension ref="A1:{col_letter(ncol)}{last}"/>', new)
+    new = re.sub(r'<autoFilter ref="A1:([A-Z]+)\d+"', lambda m: f'<autoFilter ref="A1:{m.group(1)}{last}"', new)
     return new
 
 
@@ -209,52 +227,86 @@ class Grid:
 
 
 def update_mapping(sheet_xml, grid):
-    """Recalculate cached values of the Mapping formulas (formulas themselves untouched)."""
-    # read the generator formulas from row 2 (shared or plain)
-    f2 = {c: unescape(f) for c, f in re.findall(r'<c r="([A-Z]+)2"[^>]*><f[^>]*>([^<]*)</f>', sheet_xml)}
-    m = re.search(r"(-?\d+)\+(\d+)\*MOD\(ROW\(\)-2,(\d+)\)", f2.get("F", ""))
-    if not m:
-        raise ValueError("Mapping!F2 current formula not recognised")
-    i0, istep, per = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    mt = re.search(r"(-?\d+)\+(\d+)\*INT\(\(ROW\(\)-2\)/(\d+)\)", f2.get("E", ""))
-    t0, tstep, tper = int(mt.group(1)), int(mt.group(2)), int(mt.group(3))
-    mc = re.search(r"MOD\(INT\(\(ROW\(\)-2\)/(\d+)\),(\d+)\)\+1", f2.get("D", ""))
-    cper, cmod = int(mc.group(1)), int(mc.group(2))
+    """Recalculate cached values of the Mapping formulas (formulas themselves untouched).
 
-    def lookup_cols(formula):
-        # SUMIFS(RawData!$P:$P,RawData!$E:$E,$E2,RawData!$F:$F,"CH"&$D2,RawData!$AF:$AF,$F2)
-        s = re.search(r"SUMIFS\(RawData!\$([A-Z]+):\$[A-Z]+,(.*)\)\)\s*$", formula)
-        out = s.group(1)
-        pairs = re.findall(r'RawData!\$([A-Z]+):\$[A-Z]+,("CH"&)?\$([A-Z]+)\d+', s.group(2))
-        return out, pairs
+    Each column is classified by its formula, so columns can be added or moved freely:
+      MOD(INT((ROW()-2)/n),m)+1        -> channel number
+      a+b*INT((ROW()-2)/n)             -> temperature
+      a+b*MOD(ROW()-2,n)               -> current
+      RawData!A2 (relative)            -> same-row RawData cell
+      IF(RawData!$B$2="","",...)       -> fixed RawData cell
+      IF(COUNTIFS(..)=0,"",SUMIFS(..)) -> lookup in RawData
+      G3-G2                            -> difference to previous row
+      RawData!A2&"-text" (header row)  -> text
+    """
+    cell_pat = re.compile(r'<c r="([A-Z]+)(\d+)"[^>]*?>(?:<f[^>]*>([^<]*)</f>)?')
+    first_f = {}  # col -> (row, formula) : first explicit formula below the header
+    hdr_f = {}    # col -> formula in row 1
+    for col, r, f in cell_pat.findall(sheet_xml):
+        if not f:
+            continue
+        r = int(r)
+        if r == 1:
+            hdr_f[col] = unescape(f)
+        elif col not in first_f:
+            first_f[col] = (r, unescape(f))
 
-    lk = {c: lookup_cols(f2[c]) for c in ("G", "H") if c in f2 and "SUMIFS" in f2[c]}
+    kinds = {}
+    for col, (r0, f) in first_f.items():
+        m = re.fullmatch(r"MOD\(INT\(\(ROW\(\)-2\)/(\d+)\),(\d+)\)\+1", f)
+        if m:
+            kinds[col] = ("ch", int(m.group(1)), int(m.group(2)))
+            continue
+        m = re.fullmatch(r"(-?\d+)\+(\d+)\*INT\(\(ROW\(\)-2\)/(\d+)\)", f)
+        if m:
+            kinds[col] = ("block", int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            continue
+        m = re.fullmatch(r"(-?\d+)\+(\d+)\*MOD\(ROW\(\)-2,(\d+)\)", f)
+        if m:
+            kinds[col] = ("cycle", int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            continue
+        m = re.fullmatch(r"RawData!([A-Z]+)(\d+)", f)
+        if m:
+            kinds[col] = ("rel", m.group(1), int(m.group(2)) - r0)
+            continue
+        m = re.fullmatch(r'IF\(RawData!\$([A-Z]+)\$(\d+)="","",RawData!\$[A-Z]+\$\d+\)', f)
+        if m:
+            kinds[col] = ("fixed", m.group(1), int(m.group(2)))
+            continue
+        m = re.search(r"SUMIFS\(RawData!\$([A-Z]+):\$[A-Z]+,(.*)\)\)\s*$", f)
+        if m:
+            pairs = re.findall(r'RawData!\$([A-Z]+):\$[A-Z]+,("CH"&)?\$([A-Z]+)\d+', m.group(2))
+            kinds[col] = ("lookup", m.group(1), pairs)
+            continue
+        m = re.fullmatch(rf"([A-Z]+){r0}-([A-Z]+){r0 - 1}", f)
+        if m and m.group(1) == m.group(2):
+            kinds[col] = ("diff", m.group(1))
+            continue
+        print(f"   ! Mapping column {col}: formula not recognised, cached value left as is ({f[:60]})")
 
-    vals = {}  # (col,row) -> value
-
-    def compute(col, r):
+    def compute(kind, r):
         k = r - 2
-        if col == "D":
-            return (k // cper) % cmod + 1
-        if col == "E":
-            return t0 + tstep * (k // tper)
-        if col == "F":
-            return i0 + istep * (k % per)
-        if col == "C":
-            v = grid.cell("B", 2)
-            return "" if v in (None, "") else v
-        if col == "B":
-            v = grid.cell("A", r)
+        t = kind[0]
+        if t == "ch":
+            return (k // kind[1]) % kind[2] + 1
+        if t == "block":
+            return kind[1] + kind[2] * (k // kind[3])
+        if t == "cycle":
+            return kind[1] + kind[2] * (k % kind[3])
+        if t == "rel":
+            v = grid.cell(kind[1], r + kind[2])
             return 0 if v in (None, "") else v
-        if col in lk:
-            out, pairs = lk[col]
+        if t == "fixed":
+            v = grid.cell(kind[1], kind[2])
+            return "" if v in (None, "") else v
+        if t == "lookup":
             crit = []
-            for raw_col, ch_prefix, map_col in pairs:
-                v = vals[(map_col, r)]
+            for raw_col, ch_prefix, map_col in kind[2]:
+                v = vals.get((map_col, r))
                 crit.append((raw_col, f"CH{v}" if ch_prefix else v))
-            return grid.lookup(out, crit)
-        if col == "I":
-            a, b = vals.get(("G", r)), vals.get(("G", r - 1))
+            return grid.lookup(kind[1], crit)
+        if t == "diff":
+            a, b = vals.get((kind[1], r)), vals.get((kind[1], r - 1))
             if isinstance(a, (int, float)) and isinstance(b, (int, float)):
                 return round(a - b, 10)
             if a is None or b is None:
@@ -262,19 +314,38 @@ def update_mapping(sheet_xml, grid):
             return "#VALUE!"
         return None
 
-    order = ["B", "C", "D", "E", "F", "G", "H", "I"]
+    vals = {}  # (col,row) -> value
     rownums = sorted({int(n) for n in re.findall(r'<c r="[A-Z]+(\d+)"', sheet_xml)})
+    stage = {"ch": 0, "block": 0, "cycle": 0, "rel": 0, "fixed": 0, "lookup": 1, "diff": 2}
+    order = sorted(kinds, key=lambda c: (stage[kinds[c][0]], col_index(c)))
     for r in rownums:
         if r < 2:
             continue
         for c in order:
-            vals[(c, r)] = compute(c, r)
+            if r < first_f[c][0]:   # e.g. no ΔWL formula in the first data row
+                continue
+            vals[(c, r)] = compute(kinds[c], r)
+
+    # header-row formulas such as RawData!A2&"-Case_Temp"
+    for col, f in hdr_f.items():
+        parts = re.findall(r'RawData!\$?([A-Z]+)\$?(\d+)|"([^"]*)"', f)
+        if parts and re.fullmatch(r'(?:RawData!\$?[A-Z]+\$?\d+|"[^"]*")(?:&(?:RawData!\$?[A-Z]+\$?\d+|"[^"]*"))*', f):
+            txt = ""
+            for c_, r_, lit in parts:
+                if c_:
+                    v = grid.cell(c_, int(r_))
+                    txt += "" if v is None else (fmt_num(v) if isinstance(v, (int, float)) else str(v))
+                else:
+                    txt += lit
+            vals[(col, 1)] = txt
 
     pat = re.compile(r'<c r="([A-Z]+)(\d+)"([^>/]*)>(<f[^>]*/>|<f[^>]*>[^<]*</f>)(?:<v>[^<]*</v>)?</c>')
 
     def rep(mm):
         col, r, attrs, f = mm.group(1), int(mm.group(2)), mm.group(3), mm.group(4)
-        v = vals.get((col, r))
+        if (col, r) not in vals:
+            return mm.group(0)
+        v = vals[(col, r)]
         attrs = re.sub(r'\s*t="[^"]*"', "", attrs)
         if v is None:
             return f'<c r="{col}{r}"{attrs}>{f}</c>'
@@ -284,7 +355,8 @@ def update_mapping(sheet_xml, grid):
             return f'<c r="{col}{r}"{attrs} t="str">{f}<v>{escape(v)}</v></c>'
         return f'<c r="{col}{r}"{attrs}>{f}<v>{fmt_num(v)}</v></c>'
 
-    return pat.sub(rep, sheet_xml), vals
+    lookup_cols = [c for c in order if kinds[c][0] == "lookup"]
+    return pat.sub(rep, sheet_xml), vals, (lookup_cols[0] if lookup_cols else None)
 
 
 def update_chart(xml, old_sn, new_sn, vals):
@@ -346,9 +418,10 @@ def fill_template(template, txt_path, out_path):
     new_raw = rawdata_xml(raw_xml, hdr_row, rows)
 
     grid = Grid(tmpl_headers, rows)
-    new_map, vals = update_mapping(z.read(map_path).decode("utf-8"), grid)
+    new_map, vals, wl_col = update_mapping(z.read(map_path).decode("utf-8"), grid)
 
     wb = z.read("xl/workbook.xml").decode("utf-8")
+    wb = re.sub(r"(RawData!\$A\$1:\$[A-Z]+\$)\d+", lambda m: f"{m.group(1)}{len(rows) + 1}", wb)
     if "fullCalcOnLoad" not in wb:
         wb = re.sub(r"<calcPr([^>]*?)/>", r'<calcPr\1 fullCalcOnLoad="1"/>', wb)
 
@@ -371,7 +444,7 @@ def fill_template(template, txt_path, out_path):
     z.close()
     os.replace(tmp, out_path)
 
-    g = [v for (c, r), v in vals.items() if c == "G"]
+    g = [v for (c, r), v in vals.items() if c == wl_col and r >= 2]
     blanks = sum(1 for v in g if v == "")
     return len(rows), len(g), blanks, new_sn
 
@@ -394,10 +467,10 @@ def pick_txt_files():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fill 50-400mA / 80-400mA chart templates from OSA raw TXT")
+    ap = argparse.ArgumentParser(description="Fill Template-*.xlsx chart templates from OSA raw TXT")
     ap.add_argument("inputs", nargs="*", help="TXT file(s) or folder(s); if omitted a file picker opens")
-    ap.add_argument("--t50", default=DEFAULT_T50, help="50-400mA template xlsx")
-    ap.add_argument("--t80", default=DEFAULT_T80, help="80-400mA template xlsx")
+    ap.add_argument("--templates", default=None,
+                    help="folder with Template-*.xlsx (default: this script's folder and its templates/ folder)")
     ap.add_argument("--out", default=None, help="output folder (default: same folder as each TXT)")
     a = ap.parse_args()
 
@@ -411,10 +484,11 @@ def main():
         txts += sorted(glob.glob(os.path.join(p, "*.txt"))) if os.path.isdir(p) else [p]
     if not txts:
         sys.exit("No TXT files found.")
-    templates = [("50-400mA", a.t50), ("80-400mA", a.t80)]
-    for label, t in templates:
-        if not os.path.isfile(t):
-            sys.exit(f"Template not found: {t}")
+    folders = [a.templates] if a.templates else [HERE, os.path.join(HERE, "templates")]
+    templates = find_templates(*folders)
+    if not templates:
+        sys.exit(f"No Template-*.xlsx found in {folders}")
+    print("Templates:", ", ".join(lab for lab, _ in templates))
 
     for txt in txts:
         stem = os.path.splitext(os.path.basename(txt))[0]
